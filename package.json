@@ -1,0 +1,9 @@
+{
+  "name": "studysnap-netlify",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "mammoth": "^1.9.1"
+  }
+}
