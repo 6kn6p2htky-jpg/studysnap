@@ -6,10 +6,10 @@ export default async (req) => {
     return json(405, { error: "Méthode non autorisée." });
   }
 
-  const key = process.env.EDENAI_API_KEY;
+  const key = process.env.GEMINI_API_KEY;
   if (!key) {
     return json(500, {
-      error: "La variable EDENAI_API_KEY est absente de Netlify."
+      error: "La variable GEMINI_API_KEY est absente de Netlify."
     });
   }
 
@@ -44,25 +44,34 @@ export default async (req) => {
       "Schéma":
         "Crée un schéma textuel clair avec étapes, liens et flèches.",
       "Flashcards":
-        "Crée 8 à 12 flashcards avec une question et une réponse."
+        "Crée 8 à 12 flashcards. Remplis cards avec front (question) et back (réponse)."
     };
 
-    const content = [{
-      type: "text",
+    const parts = [{
       text: `Tu es StudySnap, assistant pédagogique.
-Analyse fidèlement le contenu fourni, sans inventer.
-Si une partie importante est ambiguë ou illisible, demande une clarification.
-Format : ${format}.
-${specs[format] || specs["Fiche de révision"]}
+Analyse fidèlement les documents fournis sans inventer.
+Si une partie importante est illisible ou ambiguë,
+demande une clarification.
+
+Format demandé : ${format}.
+Consigne : ${specs[format] || specs["Fiche de révision"]}
 Correction : ${correction || "aucune"}.
 
 Réponds uniquement en JSON valide avec les champs :
-{"status":"ok","title":"...","content":"...","cards":[{"front":"question","back":"réponse"}],"unclearPassage":"...","clarificationQuestion":"..."}
+{
+ "status":"ok ou needs_clarification",
+ "title":"titre",
+ "content":"contenu",
+ "cards":[{"front":"question","back":"réponse"}],
+ "unclearPassage":"passage incertain",
+ "clarificationQuestion":"question à poser"
+}
 
-Pour Flashcards, fournis 8 à 12 cartes.
-Pour les autres formats, cards=[].
-Si une clarification est nécessaire, status="needs_clarification".
-Français clair et fidèle au cours.`
+Pour Flashcards, crée 8 à 12 cartes.
+Pour les autres formats, cards doit être un tableau vide.
+Si une clarification est nécessaire, utilise
+status = needs_clarification.
+Réponds en français clair.`
     }];
 
     for (const file of attachments) {
@@ -71,7 +80,7 @@ Français clair et fidèle au cours.`
         return json(400, { error: "Fichier invalide." });
       }
 
-      if (file.data.length > 5_500_000) {
+      if (file.data.length > 5500000) {
         return json(413, {
           error: `Fichier trop volumineux : ${file.name}.`
         });
@@ -87,17 +96,21 @@ Français clair et fidèle au cours.`
         });
       }
 
-      const mime = (file.type || match[1] || "").toLowerCase();
+      const mime = (file.type || match[1] || "")
+        .toLowerCase();
       const buffer = Buffer.from(match[2], "base64");
-      const ext = (file.name.split(".").pop() || "").toLowerCase();
+      const ext = (file.name.split(".").pop() || "")
+        .toLowerCase();
 
       if (
         mime.startsWith("image/") ||
-        ["jpg", "jpeg", "png", "webp"].includes(ext)
+        ["jpg", "jpeg", "png", "webp", "gif", "heic"].includes(ext)
       ) {
-        content.push({
-          type: "image_url",
-          image_url: { url: file.data }
+        parts.push({
+          inlineData: {
+            mimeType: mime || "image/jpeg",
+            data: match[2]
+          }
         });
       } else if (
         ext === "docx" ||
@@ -108,45 +121,49 @@ Français clair et fidèle au cours.`
 
         if (!text) {
           return json(422, {
-            error: `Aucun texte lisible trouvé dans ${file.name}.`
+            error: `Aucun texte lisible dans ${file.name}.`
           });
         }
 
-        content.push({
-          type: "text",
+        parts.push({
           text: `CONTENU DU DOCUMENT WORD ${file.name} :\n${text}`
         });
       } else if (["txt", "md", "csv"].includes(ext)) {
-        content.push({
-          type: "text",
+        parts.push({
           text: `CONTENU DU FICHIER ${file.name} :\n${buffer.toString("utf8")}`
+        });
+      } else if (ext === "pdf" || mime === "application/pdf") {
+        parts.push({
+          inlineData: {
+            mimeType: "application/pdf",
+            data: match[2]
+          }
         });
       } else {
         return json(415, {
-          error: `Le format ${ext || mime} n'est pas encore pris en charge par cette version.`
+          error: `Format non pris en charge : ${ext || mime}.`
         });
       }
     }
 
     const response = await fetch(
-      "https://api.edenai.run/v3/chat/completions",
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
       {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${key}`,
           "Content-Type": "application/json",
-          Accept: "application/json"
+          "x-goog-api-key": key
         },
         body: JSON.stringify({
-          model: process.env.EDENAI_MODEL || "openai/gpt-4o-mini",
-          messages: [
-            {
-              role: "user",
-              content
-            }
-          ],
-          response_format: { type: "json_object" },
-          stream: false
+          contents: [{
+            role: "user",
+            parts
+          }],
+          generationConfig: {
+            responseMimeType: "application/json",
+            temperature: 0.2,
+            maxOutputTokens: 8192
+          }
         })
       }
     );
@@ -154,34 +171,31 @@ Français clair et fidèle au cours.`
     const data = await response.json();
 
     if (!response.ok) {
-      console.error("Eden AI error:", data);
+      console.error("Gemini error:", data);
       return json(response.status, {
-        error: data.message || data.error?.message ||
-          "Eden AI n'a pas accepté la demande. Vérifie le modèle et les crédits."
+        error: data.error?.message || "Erreur de l'API Gemini."
       });
     }
 
-    const output = data.choices?.[0]?.message?.content;
+    const output = data.candidates?.[0]?.content?.parts
+      ?.find(part => part.text)?.text;
 
     if (!output) {
-      return json(502, { error: "La réponse d'Eden AI est vide." });
+      return json(502, {
+        error: "Gemini n'a renvoyé aucun résultat."
+      });
     }
 
-    const cleaned = output
-      .replace(/^```json\s*/i, "")
-      .replace(/^```\s*/, "")
-      .replace(/\s*```$/, "")
-      .trim();
-
-    const result = JSON.parse(cleaned);
-
-    return json(200, result);
+    return new Response(output, {
+      headers: {
+        "Content-Type": "application/json; charset=utf-8"
+      }
+    });
 
   } catch (error) {
-    console.error("StudySnap Eden AI error:", error);
+    console.error("StudySnap error:", error);
     return json(500, {
-      error: "Erreur pendant la lecture du document : " +
-        (error.message || "erreur inconnue")
+      error: "Erreur de lecture : " + (error.message || "inconnue")
     });
   }
 };
